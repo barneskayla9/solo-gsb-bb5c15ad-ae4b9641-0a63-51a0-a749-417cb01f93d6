@@ -8,6 +8,7 @@ from app.adjudication import (
     circles_intersect,
     closed_intervals_intersect,
     evaluate,
+    evaluate_group,
     frequency_conflicts,
     half_open_intervals_intersect,
     minimum_frequency_gap,
@@ -139,3 +140,49 @@ class TestEvaluate:
         assert conflict.minimum_frequency_gap == 1.0
         assert conflict.time_overlap and conflict.area_overlap
         assert not conflict.frequency_intersects
+
+
+class TestEvaluateGroup:
+    def test_clean_group_has_no_conflicts_anywhere(self):
+        # Disjoint frequencies, well beyond the 2 MHz guard band.
+        members = [lic(1, flo=100, fhi=101), lic(2, flo=200, fhi=201)]
+        against, within = evaluate_group(members, [lic(9, flo=300, fhi=301)], 2.0)
+        assert against == {1: [], 2: []}
+        assert within == {1: [], 2: []}
+
+    def test_each_member_checked_against_effective_set(self):
+        members = [lic(1, flo=100, fhi=110), lic(2, flo=200, fhi=210)]
+        against, within = evaluate_group(members, [lic(9, flo=105, fhi=106)], 2.0)
+        assert len(against[1]) == 1
+        assert against[1][0].other.application_id == 9
+        assert within == {1: [], 2: []}
+
+    def test_intra_group_clash_reported_on_both_sides(self):
+        # Two members overlap each other in band but not the effective set.
+        members = [lic(1, flo=100, fhi=110), lic(2, flo=105, fhi=115)]
+        against, within = evaluate_group(members, [lic(9, flo=300, fhi=301)], 2.0)
+        assert against == {1: [], 2: []}
+        assert within[1][0].other.application_id == 2
+        assert within[2][0].other.application_id == 1
+        assert within[1][0].reason == REASON_FREQUENCY_INTERSECTION
+
+    def test_ordering_does_not_hide_intra_group_clash(self):
+        # The clash is between members at positions 1 and 3; every candidate
+        # still gets a key, and the middle member is clean.
+        members = [
+            lic(1, flo=100, fhi=110),
+            lic(2, flo=200, fhi=210),
+            lic(3, flo=105, fhi=106),
+        ]
+        against, within = evaluate_group(members, [], 2.0)
+        assert set(against) == {1, 2, 3}
+        assert within[1][0].other.application_id == 3
+        assert within[3][0].other.application_id == 1
+        assert within[2] == []
+
+    def test_guard_band_applies_within_group(self):
+        # gap 1 < guard 2 between two otherwise disjoint members
+        members = [lic(1, flo=100, fhi=110), lic(2, flo=111, fhi=112)]
+        _, within = evaluate_group(members, [], 2.0)
+        assert within[1][0].reason == REASON_WITHIN_GUARD_BAND
+        assert within[1][0].minimum_frequency_gap == 1.0

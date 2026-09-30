@@ -257,3 +257,273 @@ class TestFlow:
         r = client.get("/api/revision/7")
         assert r.status_code == 404
         assert r.json()["error"]["code"] == "revision_out_of_range"
+
+
+class TestBatchApprove:
+    BATCH = "/api/applications/batch-approve"
+
+    def _submit(self, client, name, **kw):
+        return client.post(
+            "/api/applications", json=body(name=name, **kw)
+        ).json()["id"]
+
+    def test_empty_list_rejected(self, client):
+        r = client.post(
+            self.BATCH, json={"expected_revision": 0, "application_ids": []}
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "validation_failed"
+
+    def test_duplicate_ids_rejected(self, client):
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [1, 2, 1]},
+        )
+        assert r.status_code == 422
+        details = r.json()["error"]["details"]
+        assert details[0]["code"] == "duplicate_application_id"
+        assert details[0]["duplicates"] == [1]
+        # no revision consumed
+        assert client.get("/api/revision/current").json()["current_revision"] == 0
+
+    def test_unknown_id_rejects_whole_batch(self, client):
+        a = self._submit(client, "A")
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [a, 999]},
+        )
+        assert r.status_code == 404
+        details = r.json()["error"]["details"]
+        assert details["missing_application_ids"] == [999]
+        # the valid member stays pending and no revision was consumed
+        assert client.get(f"/api/applications/{a}").json()["status"] == "pending"
+        assert client.get("/api/revision/current").json()["current_revision"] == 0
+
+    def test_happy_path_consumes_consecutive_revisions_in_order(self, client):
+        a = self._submit(client, "A", freq=(100, 101))
+        b = self._submit(client, "B", freq=(200, 201))
+        c = self._submit(client, "C", freq=(300, 301))
+
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [c, a, b]},
+        )
+        assert r.status_code == 200, r.text
+        body_ = r.json()
+        assert body_["approved"] is True
+        assert body_["from_revision"] == 0
+        assert body_["revision"] == 3
+        assert body_["to_revision"] == 3
+        assert body_["application_ids"] == [c, a, b]
+        assert [x["application_id"] for x in body_["results"]] == [c, a, b]
+        assert [x["revision"] for x in body_["results"]] == [1, 2, 3]
+        for result, expected in zip(body_["results"], ("approved",) * 3):
+            assert result["application"]["status"] == expected
+
+        # as-of each assigned revision restores exactly the members approved
+        # up to and including that item
+        snap1 = client.get("/api/revision/1").json()
+        assert snap1["effective_application_ids"] == [c]
+        snap2 = client.get("/api/revision/2").json()
+        assert snap2["effective_application_ids"] == [c, a]
+        snap3 = client.get("/api/revision/3").json()
+        assert snap3["effective_application_ids"] == [c, a, b]
+
+    def test_stale_revision_rejects_whole_batch(self, client):
+        a = self._submit(client, "A")
+        client.post(
+            f"/api/applications/{a}/approve", json={"expected_revision": 0}
+        ).raise_for_status()
+        b = self._submit(client, "B", freq=(200, 201))
+        c = self._submit(client, "C", freq=(300, 301))
+
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [b, c]},
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "stale_revision"
+        assert err["details"] == {"expected_revision": 0, "current_revision": 1}
+        # nothing partially approved, revision unchanged
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 1
+        assert current["effective_application_ids"] == [a]
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+        assert client.get(f"/api/applications/{c}").json()["status"] == "pending"
+
+    def test_status_mismatch_rejects_whole_batch(self, client):
+        a = self._submit(client, "A")
+        b = self._submit(client, "B", freq=(200, 201))
+        client.post(
+            f"/api/applications/{a}/approve", json={"expected_revision": 0}
+        ).raise_for_status()
+
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 1, "application_ids": [a, b]},
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "not_pending"
+        assert err["details"]["applications"] == [
+            {
+                "application_id": a,
+                "status": "approved",
+                "approval_revision": 1,
+            }
+        ]
+        # b is untouched
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+        assert client.get("/api/revision/current").json()["current_revision"] == 1
+
+    def test_interference_against_effective_set_rejects_whole_batch(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        client.post(
+            f"/api/applications/{a}/approve", json={"expected_revision": 0}
+        ).raise_for_status()
+        clashing = self._submit(client, "clash", freq=(105, 106))
+        clean = self._submit(client, "clean", freq=(300, 301))
+
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 1, "application_ids": [clashing, clean]},
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "interference"
+        failed = err["details"]["applications"]
+        assert [x["application_id"] for x in failed] == [clashing]
+        (conflict,) = failed[0]["conflicts"]
+        assert conflict["scope"] == "effective"
+        assert conflict["application"]["id"] == a
+        assert conflict["reason"] == "frequency_intersection"
+        # neither member approved
+        assert (
+            client.get(f"/api/applications/{clashing}").json()["status"]
+            == "pending"
+        )
+        assert client.get(f"/api/applications/{clean}").json()["status"] == "pending"
+        assert client.get("/api/revision/current").json()["current_revision"] == 1
+
+    def test_intra_group_interference_reported_for_both_sides(self, client):
+        a = self._submit(client, "A", freq=(600, 610))
+        b = self._submit(client, "B", freq=(605, 615))
+        c = self._submit(client, "C", freq=(300, 301))
+
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [a, b, c]},
+        )
+        assert r.status_code == 409
+        failed = r.json()["error"]["details"]["applications"]
+        assert [x["application_id"] for x in failed] == [a, b]
+        sides = {
+            x["application_id"]: [
+                (k["scope"], k["application"]["id"]) for k in x["conflicts"]
+            ]
+            for x in failed
+        }
+        assert sides[a] == [("group", b)]
+        assert sides[b] == [("group", a)]
+        # all members still pending, no revisions consumed
+        for app_id in (a, b, c):
+            assert (
+                client.get(f"/api/applications/{app_id}").json()["status"]
+                == "pending"
+            )
+        assert client.get("/api/revision/current").json()["current_revision"] == 0
+
+    def test_batch_and_single_share_revision_arbitration(self, client):
+        # A single approval advances the revision after the batch was based on
+        # it; the batch must then be stale, never partially approved.
+        a = self._submit(client, "A", freq=(100, 101))
+        b = self._submit(client, "B", freq=(200, 201))
+        c = self._submit(client, "C", freq=(300, 301))
+
+        client.post(
+            f"/api/applications/{a}/approve", json={"expected_revision": 0}
+        ).raise_for_status()
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [b, c]},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "stale_revision"
+
+        # re-deciding on the fresh revision succeeds and continues the sequence
+        r2 = client.post(
+            self.BATCH,
+            json={"expected_revision": 1, "application_ids": [b, c]},
+        )
+        assert r2.status_code == 200, r2.text
+        assert [x["revision"] for x in r2.json()["results"]] == [2, 3]
+
+    def test_two_batches_same_revision_one_wins_one_stale(self, client):
+        a = self._submit(client, "A", freq=(100, 101))
+        b = self._submit(client, "B", freq=(200, 201))
+        c = self._submit(client, "C", freq=(300, 301))
+        d = self._submit(client, "D", freq=(400, 401))
+
+        first = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [a, b]},
+        )
+        assert first.status_code == 200
+        # same expected revision, as if launched concurrently
+        second = client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [c, d]},
+        )
+        assert second.status_code == 409
+        assert second.json()["error"]["code"] == "stale_revision"
+        assert second.json()["error"]["details"]["current_revision"] == 2
+        for app_id in (c, d):
+            assert (
+                client.get(f"/api/applications/{app_id}").json()["status"]
+                == "pending"
+            )
+        # retry on the new revision succeeds and keeps revisions consecutive
+        retry = client.post(
+            self.BATCH,
+            json={"expected_revision": 2, "application_ids": [c, d]},
+        )
+        assert retry.status_code == 200
+        assert [x["revision"] for x in retry.json()["results"]] == [3, 4]
+
+    def test_revoke_interleaves_with_batch_revisions(self, client):
+        a = self._submit(client, "A", freq=(100, 101))
+        b = self._submit(client, "B", freq=(200, 201))
+        client.post(
+            self.BATCH,
+            json={"expected_revision": 0, "application_ids": [a, b]},
+        ).raise_for_status()
+        # revoke consumes the next shared revision
+        rev = client.post(
+            f"/api/applications/{a}/revoke", json={"reason": "moved"}
+        ).json()
+        assert rev["revision"] == 3
+
+        c = self._submit(client, "C", freq=(100, 101))
+        r = client.post(
+            f"/api/applications/{c}/approve", json={"expected_revision": 3}
+        )
+        assert r.status_code == 200 and r.json()["revision"] == 4
+
+    def test_revoked_member_rejected_with_already_revoked(self, client):
+        a = self._submit(client, "A", freq=(100, 101))
+        client.post(
+            f"/api/applications/{a}/approve", json={"expected_revision": 0}
+        ).raise_for_status()
+        client.post(
+            f"/api/applications/{a}/revoke", json={"reason": "moved"}
+        ).raise_for_status()
+        b = self._submit(client, "B", freq=(200, 201))
+
+        r = client.post(
+            self.BATCH,
+            json={"expected_revision": 2, "application_ids": [a, b]},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "already_revoked"
+        assert client.get(f"/api/applications/{b}").json()["status"] == "pending"

@@ -8,6 +8,10 @@ semantic_validation so the whole request is rejected with explicit codes:
 * ``freq_low`` may not exceed ``freq_high`` (equal is allowed, a single
   frequency);
 * ``start_time`` must be strictly earlier than ``end_time``.
+
+``BatchApprovalRequest`` additionally requires a non-empty ID list; duplicate
+IDs inside the list are checked in the handler (with the standard envelope),
+not by Pydantic.
 """
 from __future__ import annotations
 
@@ -43,6 +47,16 @@ class ApplicationCreate(BaseModel):
 class ApprovalRequest(BaseModel):
     # Revision the client based its preview decision on; required.
     expected_revision: int = Field(ge=0)
+
+
+class BatchApprovalRequest(BaseModel):
+    # Whole-group conditional approval: every listed application must still be
+    # pending and every one must pass adjudication (against the current
+    # effective set *and* against the rest of the group), or nothing is
+    # approved.
+    expected_revision: int = Field(ge=0)
+    # Non-empty list of distinct application IDs, approved in this order.
+    application_ids: list[int] = Field(min_length=1)
 
 
 class RevocationRequest(BaseModel):

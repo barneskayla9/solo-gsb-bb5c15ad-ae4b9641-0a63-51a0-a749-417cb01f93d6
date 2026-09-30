@@ -150,3 +150,47 @@ def evaluate(
                 )
             )
     return conflicts
+
+
+def evaluate_group(
+    candidates: list[License], effective: list[License], guard_band: float
+) -> tuple[dict[int, list[Conflict]], dict[int, list[Conflict]]]:
+    """Adjudicate an ordered group as one atomic decision.
+
+    Returns ``(against_effective, within_group)``, each keyed by the
+    candidate's ``application_id`` (every candidate gets a key, possibly
+    mapped to an empty list):
+
+    * ``against_effective[id]`` - clashes with the currently effective grants,
+      in effective-set order;
+    * ``within_group[id]``      - clashes with other members of this group.
+
+    Interference is symmetric, so an intra-group clash between two members is
+    reported on *both* members (each listing the other as the conflict
+    object).  Input order determines only the order in which a successful
+    group consumes its consecutive revisions; it never hides a clash.
+    """
+    against_effective: dict[int, list[Conflict]] = {
+        candidate.application_id: [] for candidate in candidates
+    }
+    within_group: dict[int, list[Conflict]] = {
+        candidate.application_id: [] for candidate in candidates
+    }
+
+    for candidate in candidates:
+        against_effective[candidate.application_id].extend(
+            evaluate(candidate, effective, guard_band)
+        )
+
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            # evaluate() with a singleton other returns 0 or 1 conflict;
+            # run both directions so each side gets itself as the subject.
+            forward = evaluate(candidates[i], [candidates[j]], guard_band)
+            if not forward:
+                continue
+            backward = evaluate(candidates[j], [candidates[i]], guard_band)
+            within_group[candidates[i].application_id].append(forward[0])
+            within_group[candidates[j].application_id].append(backward[0])
+
+    return against_effective, within_group

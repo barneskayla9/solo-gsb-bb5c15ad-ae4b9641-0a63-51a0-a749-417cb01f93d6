@@ -61,3 +61,37 @@ echo "== 10. history snapshots =="
 curl -s "$BASE/api/revision/1" | J
 curl -s "$BASE/api/revision/2" | J
 curl -s "$BASE/api/revision/current" | J
+
+echo "== 11. submit three more devices for one event (disjoint bands) =="
+mk() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":1000},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2026-10-01T13:00:00Z\",\"end\":\"2026-10-01T18:00:00Z\"}
+}"; }
+C=$(mk "Device C" 200 210); C_ID=$(echo "$C" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+D=$(mk "Device D" 300 310); D_ID=$(echo "$D" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+E=$(mk "Device E" 400 410); E_ID=$(echo "$E" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+echo "ids: $C_ID $D_ID $E_ID"
+
+echo "== 12. batch approve at revision 3, input order D,C,E -> revisions 4,5,6 =="
+post /api/applications/batch-approve \
+  "{\"expected_revision\":3,\"application_ids\":[$D_ID,$C_ID,$E_ID]}" | J
+
+echo "== 13. snapshot as of the second item (revision 5) has D and C effective =="
+curl -s "$BASE/api/revision/5" | J
+
+echo "== 14. failing batch: two members clash with each other -> whole group rejected =="
+F=$(mk "Device F" 500 510); F_ID=$(echo "$F" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+G=$(mk "Device G" 505 515); G_ID=$(echo "$G" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+H=$(mk "Device H" 600 610); H_ID=$(echo "$H" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post /api/applications/batch-approve \
+  "{\"expected_revision\":6,\"application_ids\":[$F_ID,$G_ID,$H_ID]}" | J || true
+echo "revision is still 6 and all three are pending:"
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print("current_revision =", json.load(sys.stdin)["current_revision"])'
+
+echo "== 15. malformed batches (duplicate ids / missing id) =="
+post /api/applications/batch-approve \
+  "{\"expected_revision\":6,\"application_ids\":[$F_ID,$F_ID]}" | J || true
+post /api/applications/batch-approve \
+  "{\"expected_revision\":6,\"application_ids\":[999999]}" | J || true
