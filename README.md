@@ -8,6 +8,9 @@
 - 干扰裁决：两项**有效**批准仅在 **时段相交 且 覆盖区域相交**，并且 **频段相交或最短频率间隔小于非负保护带宽** 时构成干扰
 - 乐观修订号控制并发：预览返回当前修订号，批准必须携带该号并重新裁决；
   修订号过期或与并发批准相撞，均**不得占用频段**并返回原因
+- **整组批准**：运营人员一次提交预期修订号与非空、无重复的申请 ID 列表，
+  同一事务内对当前有效许可**及组内成员**统一裁决；任一项失败则**整组不批准、
+  修订号不变**；全部通过时按输入顺序写入连续修订号，一次提交
 - 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、撤销记录
 
 ---
@@ -55,7 +58,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 30 个用例）：
+运行测试（自动使用临时 SQLite 库，共 44 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -125,9 +128,25 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   - `expected_revision != 当前修订号` → **409 `stale_revision`**（修订过期/被并发抢先）；
   - 号对但锁内**重新裁决**发现冲突 → **409 `interference`**（不得占用频段，响应体附冲突）；
   - 通过 → 写入批准事件，占用新修订号。
+- `POST /api/applications/batch-approve`（整组批准）同样携带一个
+  `expected_revision`，并要求 `application_ids` **非空且无重复**。事务持有
+  同一把单行锁，因此单笔批准、整组批准、撤销三类并发事务共享同一条线性修订裁决：
+  - 先核对列表中每个 ID 仍存在且为 `pending`；任一 ID 不存在 →
+    **404 `not_found`**（`details.invalid_application_ids` 给出具体 ID，整组不批准）；
+  - 任一申请状态不符（已批准/已撤销）、修订过期（`expected_revision`
+    不等于当前号），或任一成员与**当前有效许可**冲突、与**组内其他成员**冲突
+    → **409 `batch_approval_rejected`**，`details` 按失败类型分组：
+    `not_pending`（具体申请与状态）、`interference`（具体申请及冲突对象，
+    冲突项带 `in_group` 区分组内/有效集合来源；组内冲突按输入顺序归于后者）、
+    `expected_revision` / `current_revision`；
+  - 上述任何失败都不会写入事件，**修订号保持不变**，无部分获批；
+  - 全部通过时，按**输入顺序**为每项写入一条批准事件，占用
+    `current+1 … current+n` 的连续修订号，整组**一次提交**。
 - `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准与撤销记录
-  （`n` 超过当前修订号返回 404）。
+  （`n` 超过当前修订号返回 404）。整组获批后，按组内任一修订号查询，
+  得到的正是截至该成员获批那一刻的有效集合（如组占修订号 4、5、6，
+  查询 5 只含前两个成员）。
 
 ---
 
@@ -140,6 +159,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `GET` | `/api/applications/{id}` | 查看单笔申请 |
 | `POST` | `/api/applications/{id}/preview` | 冲突预览（返回冲突对象、触发条件、当前修订号） |
 | `POST` | `/api/applications/{id}/approve` | 携带修订号批准（锁内重新裁决） |
+| `POST` | `/api/applications/batch-approve` | 整组批准（一个修订号 + 非空无重复 ID 列表，事务内全过或全否） |
 | `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合） |
 | `GET` | `/api/revision/current` | 当前修订号 + 有效集合 + 全部事件 |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录 |
@@ -153,13 +173,14 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例） |
-| 404 | `not_found` | 申请不存在 |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组请求 ID 列表为空（`application_ids_empty`）或有重复（`application_ids_duplicate`，附 `duplicates`） |
+| 404 | `not_found` | 申请不存在；整组中任一 ID 无效（`details.invalid_application_ids` 指出具体 ID） |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 |
 | 409 | `already_revoked` | 重复撤销 |
-| 409 | `stale_revision` | 修订号过期或被并发批准抢占 |
-| 409 | `interference` | 重新裁决发现干扰，频段未占用 |
+| 409 | `stale_revision` | 修订号过期或被并发批准抢占（单笔批准） |
+| 409 | `interference` | 重新裁决发现干扰，频段未占用（单笔批准） |
+| 409 | `batch_approval_rejected` | 整组批准失败：状态不符 / 修订过期 / 与有效许可或组内成员干扰（可同时出现，`details` 分组列出具体申请及冲突对象；不产生任何批准事件，修订号不变） |
 
 ---
 
@@ -335,6 +356,93 @@ curl -s http://localhost:8000/api/revision/999
 
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`）。
+
+### 6.12 整组批准（batch-approve）
+
+一场活动多台设备分别提交申请后（假设待审批 ID 为 4、5、6，当前修订号为 3），
+运营人员携带**一个**预期修订号和**非空、无重复**的 ID 列表请求整组批准。
+服务在同一事务、同一把修订号行锁内完成全部核对：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/batch-approve \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 3, "application_ids": [4, 5, 6]}'
+```
+
+全部通过时按**输入顺序**写入批准事件、占用连续修订号 4/5/6，整组一次提交：
+
+```json
+{"approved": true, "expected_revision": 3, "from_revision": 3, "revision": 6,
+ "new_revisions": [4, 5, 6], "count": 3, "guard_band": 2.0,
+ "results": [
+   {"application_id": 4, "revision": 4, "application": {"id": 4, "status": "approved", "approval_revision": 4, ...}},
+   {"application_id": 5, "revision": 5, "application": {...}},
+   {"application_id": 6, "revision": 6, "application": {...}}
+ ]}
+```
+
+此后按组内**任一**修订号查询，都还原截至该成员获批那一刻的有效集合：
+
+```bash
+curl -s http://localhost:8000/api/revision/5
+# {"revision": 5, "effective_application_ids": [..., 4, 5], "approvals": [...前两条...], ...}
+```
+
+列表为空或含重复 ID → 422（整笔拒收，一次返回全部违例）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/applications/batch-approve \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 3, "application_ids": [4, 5, 4]}'
+```
+
+```json
+HTTP/1.1 422 Unprocessable Entity
+{"error": {"code": "validation_failed",
+  "message": "the whole batch request was rejected due to invalid fields",
+  "details": [
+    {"field": "application_ids", "code": "application_ids_duplicate",
+     "message": "application_ids must not contain duplicates", "duplicates": [4]}
+  ]}}
+```
+
+任一 ID 不存在 → 404，并指出无效 ID：
+
+```json
+{"error": {"code": "not_found",
+  "message": "batch approval rejected: some application ids do not exist",
+  "details": {"expected_revision": 3, "current_revision": 3,
+              "invalid_application_ids": [{"application_id": 99}]}}}
+```
+
+状态不符、修订过期、与当前有效许可或**组内成员**干扰任一项成立 → 409
+`batch_approval_rejected`，各失败类型在 `details` 中分组给出（可同时出现），
+整组不批准、不写事件、修订号不变：
+
+```json
+{"error": {"code": "batch_approval_rejected",
+  "message": "batch approval rejected: 1 item(s) not pending; stale revision; 1 item(s) interfere",
+  "details": {
+    "expected_revision": 2, "current_revision": 3,
+    "not_pending": [{"application_id": 4, "status": "approved", "approval_revision": 1}],
+    "interference": [{
+      "application_id": 6,
+      "conflicts": [{
+        "application": {"id": 5, ...},
+        "trigger": {"time_intersect": true, "area_intersect": true,
+                    "frequency_intersect": true, "minimum_frequency_gap": 0.0,
+                    "within_guard_band": true},
+        "reason": "frequency_intersection", "in_group": true}]}]
+  }}}
+```
+
+- `not_pending`：逐项给出 `application_id`、当前 `status` 与
+  `approval_revision`（若曾获批）。
+- `interference`：逐项给出申请 ID 与冲突列表；冲突结构与单笔预览一致，
+  额外带布尔字段 `in_group`——`true` 表示冲突对象是本组其他成员，
+  `false` 表示当前有效许可。组内成员互相干扰时，冲突归于**输入顺序靠后**的成员。
+- 失败后可直接修正请求（删除/替换问题 ID、更新 `expected_revision`）重试；
+  并发的单笔批准、整组批准或撤销共享同一修订裁决，不会出现部分获批。
 
 ---
 

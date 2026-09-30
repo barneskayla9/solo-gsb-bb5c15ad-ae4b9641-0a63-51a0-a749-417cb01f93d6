@@ -45,5 +45,14 @@ class ApprovalRequest(BaseModel):
     expected_revision: int = Field(ge=0)
 
 
+class BatchApprovalRequest(BaseModel):
+    # One expected revision gates the whole group; all ids are adjudicated
+    # together in a single transaction.  Non-empty / no-duplicate rules are
+    # enforced manually in the endpoint so the response uses the same custom
+    # error-code envelope as semantic validation.
+    expected_revision: int = Field(ge=0)
+    application_ids: list[int]
+
+
 class RevocationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)

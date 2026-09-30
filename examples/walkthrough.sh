@@ -57,7 +57,57 @@ post "/api/applications/$A_ID/revoke" '{"reason":"postponed"}' | J
 echo "== 9. approve B at revision 2 =="
 post "/api/applications/$B_ID/approve" '{"expected_revision":2}' | J
 
-echo "== 10. history snapshots =="
+echo "== 10. batch-approve three non-interfering devices (revs 4,5,6) =="
+D1=$(post /api/applications '{
+  "name":"Stage device D1",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":200,"high":201},
+  "time_window":{"start":"2026-10-02T08:00:00Z","end":"2026-10-02T12:00:00Z"}
+}')
+D2=$(post /api/applications '{
+  "name":"Stage device D2",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":203,"high":204},
+  "time_window":{"start":"2026-10-02T08:00:00Z","end":"2026-10-02T12:00:00Z"}
+}')
+D3=$(post /api/applications '{
+  "name":"Stage device D3",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":206,"high":207},
+  "time_window":{"start":"2026-10-02T08:00:00Z","end":"2026-10-02T12:00:00Z"}
+}')
+D1_ID=$(echo "$D1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+D2_ID=$(echo "$D2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+D3_ID=$(echo "$D3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post /api/applications/batch-approve "{
+  \"expected_revision\":3,
+  \"application_ids\":[$D1_ID,$D2_ID,$D3_ID]
+}" | J
+
+echo "== 11. snapshot at revision 5 contains only the first two group members =="
+curl -s "$BASE/api/revision/5" | J
+
+echo "== 12. batch-approve an interfering pair -> whole group rejected =="
+E1=$(post /api/applications '{
+  "name":"Device E1",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":300,"high":310},
+  "time_window":{"start":"2026-10-03T08:00:00Z","end":"2026-10-03T12:00:00Z"}
+}')
+E2=$(post /api/applications '{
+  "name":"Device E2",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":305,"high":315},
+  "time_window":{"start":"2026-10-03T08:00:00Z","end":"2026-10-03T12:00:00Z"}
+}')
+E1_ID=$(echo "$E1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+E2_ID=$(echo "$E2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post /api/applications/batch-approve "{
+  \"expected_revision\":6,
+  \"application_ids\":[$E1_ID,$E2_ID]
+}" | J || true
+
+echo "== 13. history snapshots =="
 curl -s "$BASE/api/revision/1" | J
 curl -s "$BASE/api/revision/2" | J
 curl -s "$BASE/api/revision/current" | J
